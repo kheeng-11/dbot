@@ -9,7 +9,7 @@ DERIV_API = "wss://ws.derivws.com/websockets/v3?app_id=64396"
 
 SYMBOL = "R_75"
 BARRIER_OFFSET = "+100.5555"
-STAKE_AMOUNT = 5
+STAKE_AMOUNT = 10
 DURATION = 5
 DURATION_UNIT = "t"
 CURRENCY = "USD"
