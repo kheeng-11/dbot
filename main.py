@@ -8,8 +8,11 @@ API_TOKEN = "aiKRjkAWvtFVO6m"
 DERIV_API = "wss://ws.derivws.com/websockets/v3?app_id=64396"
 
 SYMBOL = "R_75"
-BARRIER_OFFSET = "+0.001"
-STAKE_AMOUNT = 10
+BARRIER_OFFSET = "+0.0001"
+STAKE_BASE = 0.35
+STAKE_AMOUNT = STAKE_BASE
+MARTINGALE_MULTIPLIER = 2
+MAX_LOSS_COUNT = 5
 DURATION = 5
 DURATION_UNIT = "t"
 CURRENCY = "USD"
@@ -24,7 +27,7 @@ MACD_LONG = 26
 
 VOLATILITY_THRESHOLD = 15.5
 MA_GAP_THRESHOLD = 4.0
-BB_WIDTH_THRESHOLD = 90  # Smaller means more consolidation, adjust as needed
+BB_WIDTH_THRESHOLD = 90
 
 price_history_fast = deque(maxlen=MA_FAST_PERIOD)
 price_history_20 = deque(maxlen=MA_20_PERIOD)
@@ -37,6 +40,7 @@ macd_history = deque(maxlen=2)
 contract_running = False
 last_spot = None
 volatility_session_active = False
+loss_count = 0
 
 def calculate_bollinger_bands(prices, period=20, num_std_dev=2):
     sma = sum(prices) / period
@@ -46,10 +50,7 @@ def calculate_bollinger_bands(prices, period=20, num_std_dev=2):
     return upper, lower, upper - lower
 
 def calculate_atr(prices):
-    trs = []
-    for i in range(1, len(prices)):
-        tr = abs(prices[i] - prices[i-1])
-        trs.append(tr)
+    trs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
     return sum(trs) / len(trs)
 
 def calculate_ema(prices, period):
@@ -105,21 +106,21 @@ async def deriv_bot():
                 ma50 = sum(price_history_50) / MA_50_PERIOD
                 ma_gap = abs(ma20 - ma50)
 
-                bb_upper, bb_lower, bb_width = calculate_bollinger_bands(bb_prices, BB_PERIOD)
+                _, _, bb_width = calculate_bollinger_bands(bb_prices, BB_PERIOD)
                 atr = calculate_atr(atr_prices)
                 macd_value = calculate_macd(macd_prices)
                 macd_history.append(macd_value)
 
                 print(f"Spot: {spot_price} | MA Gap: {round(ma_gap, 5)} | BB Width: {round(bb_width, 5)} | ATR: {round(atr, 5)} | MACD: {round(macd_value, 5)}")
 
-                # ✅ Conditions
                 if (ma_gap < MA_GAP_THRESHOLD or
                     not (spot_price < ma20 and spot_price < ma50 and ma20 < ma50) or
                     bb_width > BB_WIDTH_THRESHOLD or
                     atr > VOLATILITY_THRESHOLD or
                     macd_value >= 0 or
                     len(macd_history) < 2 or
-                    not is_falling(list(macd_history))):
+                    not is_falling(list(macd_history)) or
+                    loss_count >= MAX_LOSS_COUNT):
                     last_spot = spot_price
                     continue
 
@@ -147,7 +148,7 @@ async def deriv_bot():
                 break
 
 async def propose_and_buy(websocket, contract_type):
-    global contract_running
+    global contract_running, STAKE_AMOUNT, loss_count
 
     await websocket.send(json.dumps({
         "proposal": 1,
@@ -179,10 +180,40 @@ async def propose_and_buy(websocket, contract_type):
         if buy_data.get("buy"):
             print("✅ TRADE PLACED:", buy_data["buy"])
             contract_running = True
+            contract_id = buy_data["buy"]["contract_id"]
+            await monitor_contract(websocket, contract_id)
+
             print("⏳ Waiting 10s before restarting session...")
             await asyncio.sleep(10)
             contract_running = False
         else:
             print("⚠️ Buy failed:", buy_data)
+
+async def monitor_contract(websocket, contract_id):
+    global STAKE_AMOUNT, loss_count
+
+    await websocket.send(json.dumps({
+        "proposal_open_contract": 1,
+        "contract_id": contract_id,
+        "subscribe": 1
+    }))
+
+    while True:
+        response = await websocket.recv()
+        data = json.loads(response)
+
+        if data.get("msg_type") == "proposal_open_contract":
+            if data["proposal_open_contract"]["is_sold"]:
+                profit = data["proposal_open_contract"]["profit"]
+                if profit > 0:
+                    print(f"✅ CONTRACT WON → Profit: {profit}")
+                    STAKE_AMOUNT = STAKE_BASE
+                    loss_count = 0
+                else:
+                    print(f"❌ CONTRACT LOST → Loss: {profit}")
+                    loss_count += 1
+                    STAKE_AMOUNT = STAKE_BASE * (MARTINGALE_MULTIPLIER ** loss_count)
+                    print(f"➡️ Next stake: {STAKE_AMOUNT}")
+                break
 
 asyncio.run(deriv_bot())
