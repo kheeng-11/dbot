@@ -8,10 +8,10 @@ API_TOKEN = "aiKRjkAWvtFVO6m"
 DERIV_API = "wss://ws.derivws.com/websockets/v3?app_id=64396"
 
 SYMBOL = "R_75"
-BARRIER_OFFSET = "+200.5555"
-STAKE_AMOUNT = 10
-DURATION = 1
-DURATION_UNIT = "m"
+BARRIER_OFFSET = "+100.5555"
+STAKE_AMOUNT = 5
+DURATION = 5
+DURATION_UNIT = "t"
 CURRENCY = "USD"
 
 MA_FAST_PERIOD = 10
@@ -19,23 +19,16 @@ MA_20_PERIOD = 20
 MA_50_PERIOD = 50
 BB_PERIOD = 20
 ATR_PERIOD = 14
-AROON_PERIOD = 30
-MACD_SHORT = 12
-MACD_LONG = 26
-MACD_SIGNAL = 9
 
 VOLATILITY_THRESHOLD = 15.5
 MA_GAP_THRESHOLD = 4.0
-BB_WIDTH_THRESHOLD = 90
+BB_WIDTH_THRESHOLD = 90  # Smaller means more consolidation, adjust as needed
 
 price_history_fast = deque(maxlen=MA_FAST_PERIOD)
 price_history_20 = deque(maxlen=MA_20_PERIOD)
 price_history_50 = deque(maxlen=MA_50_PERIOD)
 bb_prices = deque(maxlen=BB_PERIOD)
-atr_prices = deque(maxlen=ATR_PERIOD + 1)
-aroon_prices = deque(maxlen=AROON_PERIOD)
-macd_prices = deque(maxlen=MACD_LONG)
-macd_history = deque(maxlen=5)
+atr_prices = deque(maxlen=ATR_PERIOD + 1)  # ATR needs previous close
 
 contract_running = False
 last_spot = None
@@ -46,7 +39,7 @@ def calculate_bollinger_bands(prices, period=20, num_std_dev=2):
     std_dev = statistics.stdev(prices)
     upper = sma + (num_std_dev * std_dev)
     lower = sma - (num_std_dev * std_dev)
-    return upper, lower, upper - lower
+    return upper, lower, upper - lower  # Return also BB width
 
 def calculate_atr(prices):
     trs = []
@@ -54,29 +47,6 @@ def calculate_atr(prices):
         tr = abs(prices[i] - prices[i-1])
         trs.append(tr)
     return sum(trs) / len(trs)
-
-def calculate_aroon_up(prices, period=30):
-    highest = max(prices)
-    index = list(prices)[::-1].index(highest)
-    return ((period - index) / period) * 100
-
-def calculate_ema(prices, period):
-    ema = prices[0]
-    k = 2 / (period + 1)
-    for price in prices[1:]:
-        ema = price * k + ema * (1 - k)
-    return ema
-
-def calculate_macd(prices):
-    if len(prices) < MACD_LONG:
-        return 0, 0, 0
-    ema_short = calculate_ema(list(prices)[-MACD_SHORT:], MACD_SHORT)
-    ema_long = calculate_ema(list(prices)[-MACD_LONG:], MACD_LONG)
-    macd = ema_short - ema_long
-    return macd
-
-def is_falling(series):
-    return all(earlier >= later for earlier, later in zip(series, list(series)[1:]))
 
 async def deriv_bot():
     global contract_running, last_spot, volatility_session_active
@@ -98,16 +68,12 @@ async def deriv_bot():
                 price_history_50.append(spot_price)
                 bb_prices.append(spot_price)
                 atr_prices.append(spot_price)
-                aroon_prices.append(spot_price)
-                macd_prices.append(spot_price)
 
                 if (len(price_history_fast) < MA_FAST_PERIOD or
                     len(price_history_20) < MA_20_PERIOD or
                     len(price_history_50) < MA_50_PERIOD or
                     len(bb_prices) < BB_PERIOD or
-                    len(atr_prices) < ATR_PERIOD + 1 or
-                    len(aroon_prices) < AROON_PERIOD or
-                    len(macd_prices) < MACD_LONG):
+                    len(atr_prices) < ATR_PERIOD + 1):
                     last_spot = spot_price
                     continue
 
@@ -118,38 +84,43 @@ async def deriv_bot():
 
                 bb_upper, bb_lower, bb_width = calculate_bollinger_bands(bb_prices, BB_PERIOD)
                 atr = calculate_atr(atr_prices)
-                aroon_up = calculate_aroon_up(aroon_prices, AROON_PERIOD)
-                macd_value = calculate_macd(macd_prices)
-                macd_history.append(macd_value)
 
-                print(f"Spot: {spot_price} | MA Gap: {round(ma_gap, 5)} | BB Width: {round(bb_width, 5)} | ATR: {round(atr, 5)} | Aroon Up: {round(aroon_up, 2)} | MACD: {round(macd_value, 5)}")
+                print(f"Spot: {spot_price} | MA Gap: {round(ma_gap, 5)} | BB Width: {round(bb_width, 5)} | ATR: {round(atr, 5)}")
 
-                # ✅ Conditions
-                if (ma_gap < MA_GAP_THRESHOLD or
-                    not (spot_price < ma20 and spot_price < ma50 and ma20 < ma50) or
-                    bb_width > BB_WIDTH_THRESHOLD or
-                    atr > VOLATILITY_THRESHOLD or
-                    aroon_up >= 50 or
-                    not is_falling(list(macd_history)) or
-                    macd_value >= 0 or
-                    not is_falling(aroon_prices)):
+                if ma_gap < MA_GAP_THRESHOLD:
+                    print("⚠️ Skipping: MA gap too small.")
+                    last_spot = spot_price
+                    continue
+
+                if not (spot_price < ma20 and spot_price < ma50 and ma20 < ma50):
+                    last_spot = spot_price
+                    continue
+
+                # ✅ Prefer trades when BB width is *small* (consolidation) and ATR is *low* (low volatility)
+                if bb_width > BB_WIDTH_THRESHOLD:
+                    print("❌ Skipping: Bollinger Bands too wide → Not in consolidation.")
+                    last_spot = spot_price
+                    continue
+
+                if atr > VOLATILITY_THRESHOLD:
+                    print("❌ Skipping: ATR too high → Volatility unacceptable.")
                     last_spot = spot_price
                     continue
 
                 if not contract_running and not volatility_session_active:
                     volatility_session_active = True
-                    print("✅ All conditions met → Starting volatility session...")
+                    print("✅ Consolidation detected → Starting volatility session...")
 
                 if volatility_session_active:
                     if last_spot is not None:
                         diff = abs(spot_price - last_spot)
                         if diff > VOLATILITY_THRESHOLD:
-                            print(f"🚫 Volatility spike → Discarding → Change: {diff}")
+                            print(f"🚫 Volatility spike detected → Discarding → Change: {diff}")
                             volatility_session_active = False
                             last_spot = spot_price
                             continue
 
-                    print("📉 Confirmed → Proposing PUT...")
+                    print(f"📉 All confirmations OK → Proposing PUT... {diff}")
                     await propose_and_buy(websocket, "PUT")
                     volatility_session_active = False
 
