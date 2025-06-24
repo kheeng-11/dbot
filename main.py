@@ -8,7 +8,7 @@ API_TOKEN = "aiKRjkAWvtFVO6m"
 DERIV_API = "wss://ws.derivws.com/websockets/v3?app_id=64396"
 
 SYMBOL = "R_75"
-BARRIER_OFFSET = "+100.5555"
+BARRIER_OFFSET = "+200.5555"
 STAKE_AMOUNT = 10
 DURATION = 1
 DURATION_UNIT = "m"
