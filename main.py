@@ -131,7 +131,7 @@ async def deriv_bot():
                 if volatility_session_active:
                     if last_spot is not None:
                         diff = abs(spot_price - last_spot)
-                        if diff < VOLATILITY_THRESHOLD:
+                        if diff > VOLATILITY_THRESHOLD:
                             print(f"🚫 Volatility spike detected → Discarding → Change: {diff}")
                             volatility_session_active = False
                             last_spot = spot_price
