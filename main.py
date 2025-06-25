@@ -1,188 +1,233 @@
 import asyncio
 import websockets
 import json
-from collections import deque
 import statistics
+from collections import deque
+import time
+import requests
 
+# === CONFIG ===
 API_TOKEN = "aiKRjkAWvtFVO6m"
 DERIV_API = "wss://ws.derivws.com/websockets/v3?app_id=64396"
 
 SYMBOL = "R_75"
-BARRIER_OFFSET = "+100.5555"
-STAKE_AMOUNT = 10
-DURATION = 5
-DURATION_UNIT = "t"
+INITIAL_STAKE = 10
+DURATION = 1
+DURATION_UNIT = "m"
 CURRENCY = "USD"
+COOLDOWN = 5
+MIN_CONFIDENCE = 70
 
-MA_FAST_PERIOD = 10
-MA_20_PERIOD = 20
-MA_50_PERIOD = 50
-BB_PERIOD = 20
-ATR_PERIOD = 14
-MACD_SHORT = 12
-MACD_LONG = 26
+BARRIER_CALL = "-200.9999"
+BARRIER_PUT = "+200.9999"
 
-VOLATILITY_THRESHOLD = 15.5
-MA_GAP_THRESHOLD = 4.0
-BB_WIDTH_THRESHOLD = 90  # Smaller means more consolidation, adjust as needed
+# === STATE VARIABLES ===
+price_history = deque(maxlen=60)
+last_prices = deque(maxlen=3)
+last_trade_time = 0
+current_stake = INITIAL_STAKE
+is_trading = False
 
-price_history_fast = deque(maxlen=MA_FAST_PERIOD)
-price_history_20 = deque(maxlen=MA_20_PERIOD)
-price_history_50 = deque(maxlen=MA_50_PERIOD)
-bb_prices = deque(maxlen=BB_PERIOD)
-atr_prices = deque(maxlen=ATR_PERIOD + 1)
-macd_prices = deque(maxlen=MACD_LONG)
-macd_history = deque(maxlen=2)
 
-contract_running = False
-last_spot = None
-volatility_session_active = False
+# === TELEGRAM ===
+TELEGRAM_TOKEN = "8133122189:AAFygYKQ1c2wW1bWaG1HtbhuwzjnzzZf5Ag"
+TELEGRAM_CHAT_ID = "6054213404"
 
-def calculate_bollinger_bands(prices, period=20, num_std_dev=2):
-    sma = sum(prices) / period
-    std_dev = statistics.stdev(prices)
-    upper = sma + (num_std_dev * std_dev)
-    lower = sma - (num_std_dev * std_dev)
-    return upper, lower, upper - lower
+# === UTILITY FUNCTIONS ===
+def moving_average(prices, period):
+    if len(prices) < period:
+        return None
+    return sum(list(prices)[-period:]) / period
 
-def calculate_atr(prices):
-    trs = []
-    for i in range(1, len(prices)):
-        tr = abs(prices[i] - prices[i-1])
-        trs.append(tr)
-    return sum(trs) / len(trs)
-
-def calculate_ema(prices, period):
-    ema = prices[0]
-    k = 2 / (period + 1)
-    for price in prices[1:]:
-        ema = price * k + ema * (1 - k)
-    return ema
-
-def calculate_macd(prices):
-    if len(prices) < MACD_LONG:
+def calculate_bollinger_width(prices, period=20):
+    if len(prices) < period:
         return 0
-    ema_short = calculate_ema(list(prices)[-MACD_SHORT:], MACD_SHORT)
-    ema_long = calculate_ema(list(prices)[-MACD_LONG:], MACD_LONG)
-    return ema_short - ema_long
+    sma = moving_average(prices, period)
+    std_dev = statistics.stdev(list(prices)[-period:])
+    return (sma + 2 * std_dev) - (sma - 2 * std_dev)
 
-def is_falling(series):
-    return series[0] >= series[1]
+def detect_trend(prices):
+    ma10 = moving_average(prices, 10)
+    ma20 = moving_average(prices, 20)
+    ma50 = moving_average(prices, 50)
+    if None in (ma10, ma20, ma50):
+        return None
+    if ma10 > ma20 > ma50:
+        return "CALL"
+    elif ma10 < ma20 < ma50:
+        return "PUT"
+    return None
 
-async def deriv_bot():
-    global contract_running, last_spot, volatility_session_active
+def is_moving_same_direction():
+    if len(last_prices) < 3:
+        return False
+    diffs = [last_prices[i] - last_prices[i - 1] for i in range(1, len(last_prices))]
+    return all(d > 0 for d in diffs) or all(d < 0 for d in diffs)
 
-    async with websockets.connect(DERIV_API) as websocket:
-        await websocket.send(json.dumps({"authorize": API_TOKEN}))
-        print(await websocket.recv())
+def calculate_confidence(prices, last_prices):
+    score = 0
+    ma10 = moving_average(prices, 10)
+    ma20 = moving_average(prices, 20)
+    ma50 = moving_average(prices, 50)
 
-        await websocket.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+    if ma10 and ma20 and ma50:
+        if ma10 > ma20 > ma50 or ma10 < ma20 < ma50:
+            gap1 = abs(ma10 - ma20)
+            gap2 = abs(ma20 - ma50)
+            if gap1 > 0.1 and gap2 > 0.1:
+                score += 40
+            elif gap1 > 0.05 or gap2 > 0.05:
+                score += 20
 
-        while True:
-            response = await websocket.recv()
-            data = json.loads(response)
+    width = calculate_bollinger_width(prices)
+    if width > 0.5:
+        score += 20
+    elif width > 0.3:
+        score += 10
 
-            if data.get("msg_type") == "tick":
-                spot_price = float(data['tick']['quote'])
-                price_history_fast.append(spot_price)
-                price_history_20.append(spot_price)
-                price_history_50.append(spot_price)
-                bb_prices.append(spot_price)
-                atr_prices.append(spot_price)
-                macd_prices.append(spot_price)
+    if is_moving_same_direction():
+        score += 20
 
-                if (len(price_history_fast) < MA_FAST_PERIOD or
-                    len(price_history_20) < MA_20_PERIOD or
-                    len(price_history_50) < MA_50_PERIOD or
-                    len(bb_prices) < BB_PERIOD or
-                    len(atr_prices) < ATR_PERIOD + 1 or
-                    len(macd_prices) < MACD_LONG):
-                    last_spot = spot_price
-                    continue
+    if len(last_prices) >= 2:
+        delta = abs(last_prices[-1] - last_prices[-2])
+        if delta > 0.2:
+            score += 20
+        elif delta > 0.1:
+            score += 10
 
-                ma_fast = sum(price_history_fast) / MA_FAST_PERIOD
-                ma20 = sum(price_history_20) / MA_20_PERIOD
-                ma50 = sum(price_history_50) / MA_50_PERIOD
-                ma_gap = abs(ma20 - ma50)
+    return score
 
-                bb_upper, bb_lower, bb_width = calculate_bollinger_bands(bb_prices, BB_PERIOD)
-                atr = calculate_atr(atr_prices)
-                macd_value = calculate_macd(macd_prices)
-                macd_history.append(macd_value)
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    except Exception as e:
+        print("Telegram Error:", e)
 
-                print(f"Spot: {spot_price} | MA Gap: {round(ma_gap, 5)} | BB Width: {round(bb_width, 5)} | ATR: {round(atr, 5)} | MACD: {round(macd_value, 5)}")
+# === TRADE EXECUTION ===
+async def send_trade(ws, queue, contract_type, barrier):
+    global current_stake, is_trading
+    try:
+        print(f"🎯 Entering {contract_type} trade at ${current_stake}")
+        send_telegram(f"🚀 Placing {contract_type} trade at ${current_stake} on {SYMBOL}")
 
-                # ✅ Conditions
-                if (ma_gap < MA_GAP_THRESHOLD or
-                    not (spot_price < ma20 and spot_price < ma50 and ma20 < ma50) or
-                    bb_width > BB_WIDTH_THRESHOLD or
-                    atr > VOLATILITY_THRESHOLD or
-                    macd_value >= 0 or
-                    len(macd_history) < 2 or
-                    not is_falling(list(macd_history))):
-                    last_spot = spot_price
-                    continue
-
-                if not contract_running and not volatility_session_active:
-                    volatility_session_active = True
-                    print("✅ All conditions met → Starting volatility session...")
-
-                if volatility_session_active:
-                    if last_spot is not None:
-                        diff = abs(spot_price - last_spot)
-                        if diff > VOLATILITY_THRESHOLD:
-                            print(f"🚫 Volatility spike detected → Discarding → Change: {diff}")
-                            volatility_session_active = False
-                            last_spot = spot_price
-                            continue
-
-                    print("📉 Confirmed → Proposing PUT...")
-                    await propose_and_buy(websocket, "PUT")
-                    volatility_session_active = False
-
-                last_spot = spot_price
-
-            elif data.get("msg_type") == "error":
-                print("❌ API Error:", data['error']['message'])
-                break
-
-async def propose_and_buy(websocket, contract_type):
-    global contract_running
-
-    await websocket.send(json.dumps({
-        "proposal": 1,
-        "amount": STAKE_AMOUNT,
-        "basis": "stake",
-        "contract_type": contract_type,
-        "currency": CURRENCY,
-        "duration": DURATION,
-        "duration_unit": DURATION_UNIT,
-        "symbol": SYMBOL,
-        "barrier": BARRIER_OFFSET
-    }))
-
-    proposal_response = await websocket.recv()
-    data = json.loads(proposal_response)
-
-    if data.get("proposal"):
-        proposal_id = data['proposal']['id']
-        print(f"Proposal OK → Buying: {proposal_id}")
-
-        await websocket.send(json.dumps({
-            "buy": proposal_id,
-            "price": STAKE_AMOUNT
+        await ws.send(json.dumps({
+            "proposal": 1,
+            "amount": current_stake,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": CURRENCY,
+            "duration": DURATION,
+            "duration_unit": DURATION_UNIT,
+            "symbol": SYMBOL,
+            "barrier": barrier
         }))
 
-        buy_response = await websocket.recv()
-        buy_data = json.loads(buy_response)
+        proposal = await wait_for(queue, "proposal")
+        pid = proposal['proposal']['id']
 
-        if buy_data.get("buy"):
-            print("✅ TRADE PLACED:", buy_data["buy"])
-            contract_running = True
-            print("⏳ Waiting 10s before restarting session...")
-            await asyncio.sleep(10)
-            contract_running = False
-        else:
-            print("⚠️ Buy failed:", buy_data)
+        await ws.send(json.dumps({
+            "buy": pid,
+            "price": current_stake
+        }))
+        buy_data = await wait_for(queue, "buy")
+        cid = buy_data["buy"]["contract_id"]
 
-asyncio.run(deriv_bot())
+        await ws.send(json.dumps({
+            "proposal_open_contract": 1,
+            "contract_id": cid,
+            "subscribe": 1
+        }))
+
+        while True:
+            poc = await wait_for(queue, "proposal_open_contract")
+            contract = poc["proposal_open_contract"]
+            sub_id = poc.get("subscription", {}).get("id")
+            if contract.get("is_sold"):
+                profit = contract["profit"]
+                status = contract["status"]
+                result_msg = f"🏁 Trade closed | Profit: ${profit:.2f} | Result: {status.upper()}"
+                print(result_msg)
+                send_telegram(result_msg)
+
+                if sub_id:
+                    await ws.send(json.dumps({"forget": sub_id}))
+                return status
+            await asyncio.sleep(1)
+    finally:
+        is_trading = False
+
+async def wait_for(queue, msg_type):
+    while True:
+        data = await queue.get()
+        if data.get("msg_type") == msg_type:
+            return data
+
+# === MAIN SNIPER LOOP ===
+async def run_sniper():
+    global last_trade_time, current_stake, is_trading
+    async with websockets.connect(DERIV_API) as ws:
+        queue = asyncio.Queue()
+
+        async def receiver():
+            async for msg in ws:
+                await queue.put(json.loads(msg))
+
+        asyncio.create_task(receiver())
+
+        await ws.send(json.dumps({"authorize": API_TOKEN}))
+        await wait_for(queue, "authorize")
+
+        await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+
+        while True:
+            tick = await wait_for(queue, "tick")
+            spot = tick['tick']['quote']
+            price_history.append(spot)
+            last_prices.append(spot)
+            print(f"\nTick: {spot}")
+
+            if is_trading:
+                print("⏳ Currently trading... waiting to finish")
+                continue
+
+            if time.time() - last_trade_time < COOLDOWN:
+                print("⏳ Cooldown active")
+                continue
+
+            if len(last_prices) < 3:
+                print("⌛ Waiting for direction data...")
+                continue
+
+            if not is_moving_same_direction():
+                print(f"⛔ Direction unclear → skip | Last: {[round(p, 2) for p in last_prices]}")
+                continue
+
+            trend = detect_trend(price_history)
+            if not trend:
+                print("⛔ No trend detected → skip")
+                continue
+
+            confidence = calculate_confidence(price_history, last_prices)
+            print(f"🧠 Confidence Score: {confidence}%")
+            if confidence < MIN_CONFIDENCE:
+                print("⚠️ Confidence too low → skip")
+                continue
+
+            barrier = BARRIER_CALL if trend == "CALL" else BARRIER_PUT
+            is_trading = True
+            result = await send_trade(ws, queue, trend, barrier)
+
+            if result == "won":
+                current_stake = INITIAL_STAKE
+            else:
+                current_stake *= 1  # Martingale
+
+            last_trade_time = time.time()
+            last_prices.clear()
+            await asyncio.sleep(6)
+
+# === RUN ===
+asyncio.run(run_sniper())
