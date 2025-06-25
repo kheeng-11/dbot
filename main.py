@@ -12,14 +12,14 @@ DERIV_API = "wss://ws.derivws.com/websockets/v3?app_id=64396"
 
 SYMBOL = "R_75"
 INITIAL_STAKE = 10
-DURATION = 2
+DURATION = 1
 DURATION_UNIT = "m"
 CURRENCY = "USD"
 COOLDOWN = 5
 MIN_CONFIDENCE = 70
 
-BARRIER_CALL = "-300.9999"
-BARRIER_PUT = "+300.9999"
+BARRIER_CALL = "-200.9999"
+BARRIER_PUT = "+200.9999"
 
 # === STATE VARIABLES ===
 price_history = deque(maxlen=60)
