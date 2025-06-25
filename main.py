@@ -27,7 +27,6 @@ last_prices = deque(maxlen=3)
 last_trade_time = 0
 current_stake = INITIAL_STAKE
 is_trading = False
-total_profit = 0.0  # Track total earnings
 
 # === TELEGRAM ===
 TELEGRAM_TOKEN = "8133122189:AAFygYKQ1c2wW1bWaG1HtbhuwzjnzzZf5Ag"
@@ -80,10 +79,12 @@ def calculate_confidence(prices, last_prices):
                 score += 20
 
     width = calculate_bollinger_width(prices)
-    if width > 0.5:
-        score += 20
-    elif width > 0.3:
-        score += 10
+    if width < 0.2:
+        score += 30  # Prefer tight bands (low volatility)
+    elif width < 0.3:
+        score += 15
+    else:
+        score -= 20  # Penalize high volatility
 
     if is_moving_same_direction():
         score += 20
@@ -108,7 +109,7 @@ def send_telegram(msg):
 
 # === TRADE EXECUTION ===
 async def send_trade(ws, queue, contract_type, barrier):
-    global current_stake, is_trading, total_profit
+    global current_stake, is_trading
     try:
         print(f"🎯 Entering {contract_type} trade at ${current_stake}")
         send_telegram(f"🚀 Placing {contract_type} trade at ${current_stake} on {SYMBOL}")
@@ -148,13 +149,7 @@ async def send_trade(ws, queue, contract_type, barrier):
             if contract.get("is_sold"):
                 profit = contract["profit"]
                 status = contract["status"]
-
-                total_profit += profit
-
-                result_msg = (
-                    f"🏁 Trade closed | Profit: ${profit:.2f} | Result: {status.upper()}\n"
-                    f"💼 Total Earned: ${total_profit:.2f}"
-                )
+                result_msg = f"🏁 Trade closed | Profit: ${profit:.2f} | Result: {status.upper()}"
                 print(result_msg)
                 send_telegram(result_msg)
 
@@ -216,6 +211,11 @@ async def run_sniper():
                 print("⛔ No trend detected → skip")
                 continue
 
+            volatility = calculate_bollinger_width(price_history)
+            if volatility > 0.4:
+                print(f"🚫 High volatility ({volatility:.2f}) — skipping")
+                continue
+
             confidence = calculate_confidence(price_history, last_prices)
             print(f"🧠 Confidence Score: {confidence}%")
             if confidence < MIN_CONFIDENCE:
@@ -229,7 +229,7 @@ async def run_sniper():
             if result == "won":
                 current_stake = INITIAL_STAKE
             else:
-                current_stake *= 1  # Martingale (disabled for now)
+                current_stake *= 1  # No martingale change for now
 
             last_trade_time = time.time()
             last_prices.clear()
