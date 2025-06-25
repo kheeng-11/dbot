@@ -18,8 +18,8 @@ CURRENCY = "USD"
 COOLDOWN = 5
 MIN_CONFIDENCE = 70
 
-BARRIER_CALL = "+200.9999"
-BARRIER_PUT = "-200.9999"
+BARRIER_CALL = "-200.9999"
+BARRIER_PUT = "+200.9999"
 
 # === STATE VARIABLES ===
 price_history = deque(maxlen=60)
@@ -27,7 +27,7 @@ last_prices = deque(maxlen=3)
 last_trade_time = 0
 current_stake = INITIAL_STAKE
 is_trading = False
-
+total_profit = 0.0  # Track total earnings
 
 # === TELEGRAM ===
 TELEGRAM_TOKEN = "8133122189:AAFygYKQ1c2wW1bWaG1HtbhuwzjnzzZf5Ag"
@@ -108,7 +108,7 @@ def send_telegram(msg):
 
 # === TRADE EXECUTION ===
 async def send_trade(ws, queue, contract_type, barrier):
-    global current_stake, is_trading
+    global current_stake, is_trading, total_profit
     try:
         print(f"🎯 Entering {contract_type} trade at ${current_stake}")
         send_telegram(f"🚀 Placing {contract_type} trade at ${current_stake} on {SYMBOL}")
@@ -148,7 +148,13 @@ async def send_trade(ws, queue, contract_type, barrier):
             if contract.get("is_sold"):
                 profit = contract["profit"]
                 status = contract["status"]
-                result_msg = f"🏁 Trade closed | Profit: ${profit:.2f} | Result: {status.upper()}"
+
+                total_profit += profit
+
+                result_msg = (
+                    f"🏁 Trade closed | Profit: ${profit:.2f} | Result: {status.upper()}\n"
+                    f"💼 Total Earned: ${total_profit:.2f}"
+                )
                 print(result_msg)
                 send_telegram(result_msg)
 
@@ -223,7 +229,7 @@ async def run_sniper():
             if result == "won":
                 current_stake = INITIAL_STAKE
             else:
-                current_stake *= 1  # Martingale
+                current_stake *= 1  # Martingale (disabled for now)
 
             last_trade_time = time.time()
             last_prices.clear()
